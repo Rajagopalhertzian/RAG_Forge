@@ -1,0 +1,352 @@
+name: CD Production
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to deploy (e.g., v1.2.3)'
+        required: true
+        type: string
+      skip_approval:
+        description: 'Skip manual approval (emergency only)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: contextforge-prod
+  ECS_SERVICE_API: contextforge-api-prod
+  ECS_SERVICE_MCP: contextforge-mcp-prod
+  ECS_SERVICE_WORKER: contextforge-worker-prod
+  TASK_FAMILY_API: contextforge-api-prod
+  TASK_FAMILY_MCP: contextforge-mcp-prod
+  TASK_FAMILY_WORKER: contextforge-worker-prod
+  BLUE_TARGET_GROUP_ARN: ${{ secrets.PROD_BLUE_TG_ARN }}
+  GREEN_TARGET_GROUP_ARN: ${{ secrets.PROD_GREEN_TG_ARN }}
+  ALB_LISTENER_ARN: ${{ secrets.PROD_ALB_LISTENER_ARN }}
+
+jobs:
+  # =============================================================================
+  # Pre-deployment Validation
+  # =============================================================================
+  pre-deploy-validation:
+    name: Pre-deployment Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      image_tag: ${{ steps.get-version.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tag
+        id: get-version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image_tag=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Verify tag exists in ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name ${{ github.repository }}/api \
+            --image-ids imageTag=${{ steps.get-version.outputs.image_tag }} \
+            --region ${{ env.AWS_REGION }} || exit 1
+          aws ecr describe-images \
+            --repository-name ${{ github.repository }}/worker \
+            --image-ids imageTag=${{ steps.get-version.outputs.image_tag }} \
+            --region ${{ env.AWS_REGION }} || exit 1
+          aws ecr describe-images \
+            --repository-name ${{ github.repository }}/mcp \
+            --image-ids imageTag=${{ steps.get-version.outputs.image_tag }} \
+            --region ${{ env.AWS_REGION }} || exit 1
+
+      - name: Run smoke tests against staging
+        run: |
+          STAGING_ALB=$(aws elbv2 describe-load-balancers --names contextforge-staging-alb --query 'LoadBalancers[0].DNSName' --output text --region ${{ env.AWS_REGION }})
+          curl -sf "http://$STAGING_ALB/health" || exit 1
+          curl -sf "http://$STAGING_ALB/api/v1/status" || exit 1
+
+  # =============================================================================
+  # Manual Approval Gate
+  # =============================================================================
+  approval:
+    name: Manual Approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: pre-deploy-validation
+    if: github.event.inputs.skip_approval != 'true'
+    environment: production
+    steps:
+      - name: Wait for manual approval
+        uses: trstringer/manual-approval@v1
+        with:
+          approvers: ${{ secrets.PROD_APPROVERS }}
+          minimum-approvals: 1
+          issue-title: "Production Deployment Approval: ${{ needs.pre-deploy-validation.outputs.version }}"
+          issue-body: |
+            **Deployment Request**
+            - Version: ${{ needs.pre-deploy-validation.outputs.version }}
+            - Triggered by: ${{ github.actor }}
+            - Commit: ${{ github.sha }}
+
+            **Please review:**
+            1. All CI checks passed
+            2. Staging deployment verified
+            3. Release notes prepared
+            4. Rollback plan documented
+
+            Approve to proceed with Blue/Green deployment to production.
+
+  # =============================================================================
+  # Blue/Green Deployment to Production
+  # =============================================================================
+  deploy-prod:
+    name: Blue/Green Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [pre-deploy-validation, approval]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+
+      - name: Determine active target group (Blue/Green)
+        id: active-tg
+        run: |
+          LISTENER_RULE=$(aws elbv2 describe-rules --listener-arn ${{ env.ALB_LISTENER_ARN }} --query 'Rules[?Priority!=`default`].{Priority:Priority,Actions:Actions}' --output json)
+          ACTIVE_TG=$(echo "$LISTENER_RULE" | jq -r '.[] | select(.Actions[0].TargetGroupArn != null) | .Actions[0].TargetGroupArn')
+
+          if [[ "$ACTIVE_TG" == *"${{ secrets.PROD_BLUE_TG_ARN }}"* ]]; then
+            echo "active=blue" >> $GITHUB_OUTPUT
+            echo "inactive=green" >> $GITHUB_OUTPUT
+            echo "inactive_arn=${{ secrets.PROD_GREEN_TG_ARN }}" >> $GITHUB_OUTPUT
+          else
+            echo "active=green" >> $GITHUB_OUTPUT
+            echo "inactive=blue" >> $GITHUB_OUTPUT
+            echo "inactive_arn=${{ secrets.PROD_BLUE_TG_ARN }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get current task definitions
+        id: current-tasks
+        run: |
+          API_DEF=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_API }} --query 'taskDefinition' --output json)
+          MCP_DEF=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_MCP }} --query 'taskDefinition' --output json)
+          WORKER_DEF=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_WORKER }} --query 'taskDefinition' --output json)
+          echo "api_def=$API_DEF" >> $GITHUB_OUTPUT
+          echo "mcp_def=$MCP_DEF" >> $GITHUB_OUTPUT
+          echo "worker_def=$WORKER_DEF" >> $GITHUB_OUTPUT
+
+      - name: Create new task definitions with new image tag
+        id: new-tasks
+        run: |
+          IMAGE_TAG="${{ needs.pre-deploy-validation.outputs.image_tag }}"
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          REPO="${{ github.repository }}"
+
+          NEW_API=$(echo '${{ steps.current-tasks.outputs.api_def }}' | jq --arg IMAGE "$REGISTRY/$REPO/api:$IMAGE_TAG" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          NEW_MCP=$(echo '${{ steps.current-tasks.outputs.mcp_def }}' | jq --arg IMAGE "$REGISTRY/$REPO/mcp:$IMAGE_TAG" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          NEW_WORKER=$(echo '${{ steps.current-tasks.outputs.worker_def }}' | jq --arg IMAGE "$REGISTRY/$REPO/worker:$IMAGE_TAG" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          echo "api_def=$NEW_API" >> $GITHUB_OUTPUT
+          echo "mcp_def=$NEW_MCP" >> $GITHUB_OUTPUT
+          echo "worker_def=$NEW_WORKER" >> $GITHUB_OUTPUT
+
+      - name: Register new task definitions
+        id: register-tasks
+        run: |
+          API_ARN=$(aws ecs register-task-definition --cli-input-json '${{ steps.new-tasks.outputs.api_def }}' --query 'taskDefinition.taskDefinitionArn' --output text)
+          MCP_ARN=$(aws ecs register-task-definition --cli-input-json '${{ steps.new-tasks.outputs.mcp_def }}' --query 'taskDefinition.taskDefinitionArn' --output text)
+          WORKER_ARN=$(aws ecs register-task-definition --cli-input-json '${{ steps.new-tasks.outputs.worker_def }}' --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "api_arn=$API_ARN" >> $GITHUB_OUTPUT
+          echo "mcp_arn=$MCP_ARN" >> $GITHUB_OUTPUT
+          echo "worker_arn=$WORKER_ARN" >> $GITHUB_OUTPUT
+
+      - name: Update inactive target group services (Blue/Green)
+        id: update-inactive
+        run: |
+          INACTIVE_TG="${{ steps.active-tg.outputs.inactive_arn }}"
+
+          # Update API service to use new task definition and inactive target group
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_API }}-${{ steps.active-tg.outputs.inactive }} \
+            --task-definition ${{ steps.register-tasks.outputs.api_arn }} \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100"
+
+          # Update MCP service
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_MCP }}-${{ steps.active-tg.outputs.inactive }} \
+            --task-definition ${{ steps.register-tasks.outputs.mcp_arn }} \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100"
+
+          # Update Worker service
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_WORKER }}-${{ steps.active-tg.outputs.inactive }} \
+            --task-definition ${{ steps.register-tasks.outputs.worker_arn }} \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100"
+
+      - name: Wait for inactive services to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE_API }}-${{ steps.active-tg.outputs.inactive }} ${{ env.ECS_SERVICE_MCP }}-${{ steps.active-tg.outputs.inactive }} ${{ env.ECS_SERVICE_WORKER }}-${{ steps.active-tg.outputs.inactive }}
+
+      - name: Health check inactive target group
+        run: |
+          INACTIVE_TG="${{ steps.active-tg.outputs.inactive_arn }}"
+
+          # Get targets in inactive target group
+          TARGETS=$(aws elbv2 describe-target-health --target-group-arn $INACTIVE_TG --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`].Target.Id' --output text)
+
+          if [ -z "$TARGETS" ]; then
+            echo "No healthy targets in inactive target group!"
+            exit 1
+          fi
+
+          echo "Healthy targets: $TARGETS"
+
+          # Verify health endpoint on each target
+          for TARGET in $TARGETS; do
+            if ! curl -sf "http://$TARGET:8000/health" --max-time 10; then
+              echo "Health check failed for $TARGET"
+              exit 1
+            fi
+          done
+          echo "All targets healthy!"
+
+      - name: Switch ALB traffic to new target group (Blue/Green swap)
+        run: |
+          INACTIVE_TG="${{ steps.active-tg.outputs.inactive_arn }}"
+
+          # Modify listener rule to point to new target group
+          aws elbv2 modify-rule \
+            --rule-arn $(aws elbv2 describe-rules --listener-arn ${{ env.ALB_LISTENER_ARN }} --query 'Rules[?Priority!=`default`].RuleArn' --output text) \
+            --actions Type=forward,TargetGroupArn=$INACTIVE_TG
+
+          echo "Traffic switched to ${{ steps.active-tg.outputs.inactive }} target group"
+
+      - name: Verify production health after swap
+        run: |
+          PROD_ALB=$(aws elbv2 describe-load-balancers --names contextforge-prod-alb --query 'LoadBalancers[0].DNSName' --output text --region ${{ env.AWS_REGION }})
+
+          for i in {1..20}; do
+            if curl -sf "http://$PROD_ALB/health" > /dev/null; then
+              echo "Production health check passed!"
+              exit 0
+            fi
+            echo "Waiting for production health... ($i/20)"
+            sleep 15
+          done
+          echo "Production health check failed!"
+          exit 1
+
+      - name: Update active target group services (for next deployment)
+        if: success()
+        run: |
+          ACTIVE_TG="${{ steps.active-tg.outputs.active }}"
+
+          # Update the now-inactive services to new task definition for next deployment
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_API }}-${{ steps.active-tg.outputs.active }} \
+            --task-definition ${{ steps.register-tasks.outputs.api_arn }} \
+            --force-new-deployment
+
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_MCP }}-${{ steps.active-tg.outputs.active }} \
+            --task-definition ${{ steps.register-tasks.outputs.mcp_arn }} \
+            --force-new-deployment
+
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_WORKER }}-${{ steps.active-tg.outputs.active }} \
+            --task-definition ${{ steps.register-tasks.outputs.worker_arn }} \
+            --force-new-deployment
+
+      - name: Create deployment record
+        if: success()
+        run: |
+          aws dynamodb put-item \
+            --table-name contextforge-deployments \
+            --item '{
+              "deployment_id": {"S": "'${{ github.sha }}'"},
+              "version": {"S": "${{ needs.pre-deploy-validation.outputs.version }}"},
+              "environment": {"S": "production"},
+              "status": {"S": "success"},
+              "deployed_at": {"S": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"},
+              "deployed_by": {"S": "${{ github.actor }}"},
+              "image_tag": {"S": "${{ needs.pre-deploy-validation.outputs.image_tag }}"},
+              "active_target_group": {"S": "${{ steps.active-tg.outputs.inactive }}"}
+            }' \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Notify success
+        if: success()
+        run: |
+          echo "✅ Production deployment successful!"
+          echo "Version: ${{ needs.pre-deploy-validation.outputs.version }}"
+          echo "Active target group: ${{ steps.active-tg.outputs.inactive }}"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Production deployment failed! Initiating immediate rollback..."
+
+          # Switch traffic back to previous target group
+          ACTIVE_TG="${{ steps.active-tg.outputs.active }}"
+          if [ "$ACTIVE_TG" == "blue" ]; then
+            ROLLBACK_TG="${{ secrets.PROD_BLUE_TG_ARN }}"
+          else
+            ROLLBACK_TG="${{ secrets.PROD_GREEN_TG_ARN }}"
+          fi
+
+          aws elbv2 modify-rule \
+            --rule-arn $(aws elbv2 describe-rules --listener-arn ${{ env.ALB_LISTENER_ARN }} --query 'Rules[?Priority!=`default`].RuleArn' --output text) \
+            --actions Type=forward,TargetGroupArn=$ROLLBACK_TG
+
+          echo "Traffic rolled back to $ACTIVE_TG target group"
+
+          # Record failed deployment
+          aws dynamodb put-item \
+            --table-name contextforge-deployments \
+            --item '{
+              "deployment_id": {"S": "'${{ github.sha }}'"},
+              "version": {"S": "${{ needs.pre-deploy-validation.outputs.version }}"},
+              "environment": {"S": "production"},
+              "status": {"S": "failed"},
+              "deployed_at": {"S": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"},
+              "deployed_by": {"S": "${{ github.actor }}"},
+              "image_tag": {"S": "${{ needs.pre-deploy-validation.outputs.image_tag }}"},
+              "active_target_group": {"S": "$ACTIVE_TG"}
+            }' \
+            --region ${{ env.AWS_REGION }} || true

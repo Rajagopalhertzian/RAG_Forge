@@ -1,0 +1,462 @@
+name: Nightly Evaluation & Drift Detection
+
+on:
+  schedule:
+    # Run at 2 AM UTC every day
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      dataset_version:
+        description: 'Golden dataset version to use'
+        required: false
+        default: 'v2_expanded'
+        type: choice
+        options:
+          - v1_baseline
+          - v2_expanded
+      run_generation_eval:
+        description: 'Run generation evaluation (RAGAS + LLM Judge)'
+        required: false
+        default: true
+        type: boolean
+      run_chunking_eval:
+        description: 'Run chunking evaluation'
+        required: false
+        default: true
+        type: boolean
+      run_embedding_eval:
+        description: 'Run embedding evaluation'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  PYTHON_VERSION: "3.11"
+  POETRY_VERSION: "1.8.2"
+
+jobs:
+  retrieval-eval-nightly:
+    name: Nightly Retrieval Evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Configure Poetry
+        run: poetry config virtualenvs.create false
+
+      - name: Install dependencies
+        run: poetry install --with dev,test,eval --no-interaction
+
+      - name: Run Nightly Retrieval Evaluation
+        id: retrieval-eval
+        run: |
+          DATASET="tests/evaluation/golden_sets/${{ github.event.inputs.dataset_version || 'v2_expanded' }}.jsonl"
+          poetry run python -m contextforge.evaluation.retrieval.runner \
+            --dataset "$DATASET" \
+            --output-dir nightly_retrieval_eval_results \
+            --format json \
+            --thresholds-file contextforge/evaluation/retrieval/thresholds.yaml \
+            --fail-on-threshold
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Upload Nightly Retrieval Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-retrieval-eval-results
+          path: nightly_retrieval_eval_results/
+          retention-days: 90
+
+      - name: Check for Regression
+        if: always()
+        run: |
+          if [ -f nightly_retrieval_eval_results/threshold_check.json ]; then
+            cat nightly_retrieval_eval_results/threshold_check.json
+            # Check if any metrics regressed significantly
+            python -c "
+import json
+with open('nightly_retrieval_eval_results/threshold_check.json') as f:
+    data = json.load(f)
+# Check for regression > 5% from baseline
+baseline_mrr = 0.65  # minimum threshold
+current_mrr = data['metrics']['mrr_at_10']
+if current_mrr < baseline_mrr * 0.95:
+    print(f'⚠️ REGRESSION DETECTED: MRR@10 dropped to {current_mrr:.4f} (baseline: {baseline_mrr:.4f})')
+    exit(1)
+print('✅ No significant regression detected')
+"
+          fi
+
+  generation-eval-nightly:
+    name: Nightly Generation Evaluation (RAGAS + LLM Judge)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: ${{ github.event.inputs.run_generation_eval != 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Configure Poetry
+        run: poetry config virtualenvs.create false
+
+      - name: Install dependencies
+        run: poetry install --with dev,test,eval --no-interaction
+
+      - name: Run RAGAS Evaluation
+        id: ragas-eval
+        run: |
+          poetry run python -m contextforge.evaluation.generation.ragas \
+            --dataset tests/evaluation/golden_sets/v2_expanded.jsonl \
+            --output-dir nightly_generation_eval_results \
+            --metrics faithfulness,answer_relevancy,context_precision,context_recall \
+            --threshold-faithfulness 0.85 \
+            --threshold-answer-relevancy 0.80 \
+            --threshold-context-precision 0.75 \
+            --threshold-context-recall 0.70 \
+            --model gpt-4o \
+            --batch-size 10
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LANGCHAIN_API_KEY: ${{ secrets.LANGCHAIN_API_KEY }}
+          LANGCHAIN_PROJECT: contextforge-nightly-eval
+
+      - name: Run Custom Generation Evaluation (Citation Accuracy + Hallucination)
+        id: custom-eval
+        run: |
+          poetry run python -m contextforge.evaluation.generation.custom \
+            --dataset tests/evaluation/golden_sets/v2_expanded.jsonl \
+            --output-dir nightly_generation_eval_results \
+            --citation-threshold 0.95 \
+            --hallucination-threshold 0.05 \
+            --model gpt-4o
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Run LLM Judge Pairwise Evaluation
+        id: llm-judge-eval
+        run: |
+          poetry run python -m contextforge.evaluation.generation.llm_judge \
+            --dataset tests/evaluation/golden_sets/v2_expanded.jsonl \
+            --output-dir nightly_generation_eval_results \
+            --judge-model gpt-4o \
+            --candidate-model gpt-4o-mini \
+            --threshold-win-rate 0.60 \
+            --num-comparisons 100
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Upload Nightly Generation Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-generation-eval-results
+          path: nightly_generation_eval_results/
+          retention-days: 90
+
+      - name: Check Generation Thresholds
+        if: always()
+        run: |
+          # Check RAGAS results
+          if [ -f nightly_generation_eval_results/ragas_results.json ]; then
+            echo "=== RAGAS Results ==="
+            cat nightly_generation_eval_results/ragas_results.json
+            python -c "
+import json
+with open('nightly_generation_eval_results/ragas_results.json') as f:
+    data = json.load(f)
+for metric, value in data.items():
+    if metric == 'faithfulness' and value < 0.85:
+        print(f'❌ FAITHFULNESS BELOW THRESHOLD: {value:.4f} < 0.85')
+        exit(1)
+    if metric == 'answer_relevancy' and value < 0.80:
+        print(f'❌ ANSWER RELEVANCY BELOW THRESHOLD: {value:.4f} < 0.80')
+        exit(1)
+print('✅ RAGAS thresholds passed')
+"
+          fi
+
+          # Check custom evaluation results
+          if [ -f nightly_generation_eval_results/custom_results.json ]; then
+            echo "=== Custom Evaluation Results ==="
+            cat nightly_generation_eval_results/custom_results.json
+            python -c "
+import json
+with open('nightly_generation_eval_results/custom_results.json') as f:
+    data = json.load(f)
+citation_acc = data.get('citation_accuracy', 0)
+hallucination_rate = data.get('hallucination_rate', 1)
+if citation_acc < 0.95:
+    print(f'❌ CITATION ACCURACY BELOW THRESHOLD: {citation_acc:.4f} < 0.95')
+    exit(1)
+if hallucination_rate > 0.05:
+    print(f'❌ HALLUCINATION RATE ABOVE THRESHOLD: {hallucination_rate:.4f} > 0.05')
+    exit(1)
+print('✅ Custom evaluation thresholds passed')
+"
+          fi
+
+          # Check LLM Judge results
+          if [ -f nightly_generation_eval_results/llm_judge_results.json ]; then
+            echo "=== LLM Judge Results ==="
+            cat nightly_generation_eval_results/llm_judge_results.json
+            python -c "
+import json
+with open('nightly_generation_eval_results/llm_judge_results.json') as f:
+    data = json.load(f)
+win_rate = data.get('win_rate', 0)
+if win_rate < 0.60:
+    print(f'❌ WIN RATE BELOW THRESHOLD: {win_rate:.4f} < 0.60')
+    exit(1)
+print('✅ LLM Judge threshold passed')
+"
+          fi
+
+  chunking-eval-nightly:
+    name: Nightly Chunking Evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ github.event.inputs.run_chunking_eval != 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Configure Poetry
+        run: poetry config virtualenvs.create false
+
+      - name: Install dependencies
+        run: poetry install --with dev,test,eval --no-interaction
+
+      - name: Run Chunking Evaluation
+        run: |
+          poetry run python -m contextforge.evaluation.chunking.metrics \
+            --test-data tests/evaluation/chunking/test_documents.jsonl \
+            --output-dir nightly_chunking_eval_results \
+            --chunk-sizes 256,512,1024 \
+            --overlap-ratios 0.1,0.2,0.3
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Upload Nightly Chunking Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-chunking-eval-results
+          path: nightly_chunking_eval_results/
+          retention-days: 90
+
+  embedding-eval-nightly:
+    name: Nightly Embedding Evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ github.event.inputs.run_embedding_eval != 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Configure Poetry
+        run: poetry config virtualenvs.create false
+
+      - name: Install dependencies
+        run: poetry install --with dev,test,eval --no-interaction
+
+      - name: Run Embedding Evaluation
+        run: |
+          poetry run python -m contextforge.evaluation.embedding.metrics \
+            --test-data tests/evaluation/embedding/test_pairs.jsonl \
+            --output-dir nightly_embedding_eval_results \
+            --models text-embedding-3-small,text-embedding-3-large \
+            --dimensions 1536,3072
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Upload Nightly Embedding Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-embedding-eval-results
+          path: nightly_embedding_eval_results/
+          retention-days: 90
+
+  drift-detection:
+    name: Drift Detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [retrieval-eval-nightly, generation-eval-nightly, chunking-eval-nightly, embedding-eval-nightly]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ env.POETRY_VERSION }}
+
+      - name: Configure Poetry
+        run: poetry config virtualenvs.create false
+
+      - name: Install dependencies
+        run: poetry install --with dev,test,eval --no-interaction
+
+      - name: Download Evaluation Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: eval_artifacts
+          pattern: nightly-*-eval-results
+
+      - name: Run Drift Detection
+        run: |
+          poetry run python -m contextforge.evaluation.drift_detection \
+            --artifacts-dir eval_artifacts \
+            --baseline-branch main \
+            --threshold-mrr-drop 0.05 \
+            --threshold-latency-increase 0.20 \
+            --threshold-faithfulness-drop 0.05 \
+            --output-dir drift_detection_results
+
+      - name: Upload Drift Detection Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drift-detection-results
+          path: drift_detection_results/
+          retention-days: 90
+
+      - name: Alert on Drift
+        if: always()
+        run: |
+          if [ -f drift_detection_results/drift_alert.json ]; then
+            cat drift_detection_results/drift_alert.json
+            python -c "
+import json
+with open('drift_detection_results/drift_alert.json') as f:
+    data = json.load(f)
+if data.get('drift_detected', False):
+    print('⚠️ DRIFT DETECTED - Alerting...')
+    # Here you could integrate with Slack, PagerDuty, etc.
+    exit(1)
+else:
+    print('✅ No significant drift detected')
+"
+          fi
+
+  notify-results:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [retrieval-eval-nightly, generation-eval-nightly, chunking-eval-nightly, embedding-eval-nightly, drift-detection]
+    if: always()
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+          pattern: nightly-*-eval-results
+
+      - name: Generate Summary Report
+        run: |
+          python -c "
+import json
+import os
+from pathlib import Path
+
+report = '# Nightly Evaluation Summary\n\n'
+report += f'**Date**: {os.environ.get(\"GITHUB_RUN_NUMBER\", \"unknown\")}\n'
+report += f'**Workflow**: {os.environ.get(\"GITHUB_WORKFLOW\", \"unknown\")}\n\n'
+
+artifacts_dir = Path('all_artifacts')
+for artifact_dir in artifacts_dir.iterdir():
+    if artifact_dir.is_dir():
+        report += f'## {artifact_dir.name}\n\n'
+        # Look for result files
+        for result_file in artifact_dir.rglob('*.json'):
+            report += f'- {result_file.relative_to(artifact_dir)}\n'
+        report += '\n'
+
+with open('nightly_summary.md', 'w') as f:
+    f.write(report)
+          "
+        shell: bash
+
+      - name: Post Summary to GitHub
+        if: github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('nightly_summary.md', 'utf8');
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'nightly-eval-complete',
+              client_payload: {
+                summary: summary,
+                run_number: process.env.GITHUB_RUN_NUMBER,
+                run_id: process.env.GITHUB_RUN_ID
+              }
+            });
+
+      - name: Send Slack Notification (if configured)
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"Nightly evaluation complete. Check GitHub Actions for results.\"}" \
+            $SLACK_WEBHOOK_URL
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

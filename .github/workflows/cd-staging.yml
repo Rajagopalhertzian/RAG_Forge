@@ -1,0 +1,196 @@
+name: CD Staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: contextforge-staging
+  ECS_SERVICE_API: contextforge-api-staging
+  ECS_SERVICE_MCP: contextforge-mcp-staging
+  ECS_SERVICE_WORKER: contextforge-worker-staging
+  TASK_FAMILY_API: contextforge-api-staging
+  TASK_FAMILY_MCP: contextforge-mcp-staging
+  TASK_FAMILY_WORKER: contextforge-worker-staging
+
+jobs:
+  # =============================================================================
+  # Deploy to Staging (Blue/Green via ALB Target Group Swap)
+  # =============================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine image tag
+        id: image-tag
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+
+      - name: Get current task definition (API)
+        id: current-task-api
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_API }} --query 'taskDefinition' --output json)
+          echo "task_def=$TASK_DEF" >> $GITHUB_OUTPUT
+
+      - name: Get current task definition (MCP)
+        id: current-task-mcp
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_MCP }} --query 'taskDefinition' --output json)
+          echo "task_def=$TASK_DEF" >> $GITHUB_OUTPUT
+
+      - name: Get current task definition (Worker)
+        id: current-task-worker
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_WORKER }} --query 'taskDefinition' --output json)
+          echo "task_def=$TASK_DEF" >> $GITHUB_OUTPUT
+
+      - name: Create new task definition (API)
+        id: new-task-api
+        run: |
+          CURRENT_DEF='${{ steps.current-task-api.outputs.task_def }}'
+          NEW_DEF=$(echo "$CURRENT_DEF" | jq --arg IMAGE "${{ steps.login-ecr.outputs.registry }}/${{ github.repository }}/api:${{ steps.image-tag.outputs.tag }}" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          echo "task_def=$NEW_DEF" >> $GITHUB_OUTPUT
+
+      - name: Create new task definition (MCP)
+        id: new-task-mcp
+        run: |
+          CURRENT_DEF='${{ steps.current-task-mcp.outputs.task_def }}'
+          NEW_DEF=$(echo "$CURRENT_DEF" | jq --arg IMAGE "${{ steps.login-ecr.outputs.registry }}/${{ github.repository }}/mcp:${{ steps.image-tag.outputs.tag }}" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          echo "task_def=$NEW_DEF" >> $GITHUB_OUTPUT
+
+      - name: Create new task definition (Worker)
+        id: new-task-worker
+        run: |
+          CURRENT_DEF='${{ steps.current-task-worker.outputs.task_def }}'
+          NEW_DEF=$(echo "$CURRENT_DEF" | jq --arg IMAGE "${{ steps.login-ecr.outputs.registry }}/${{ github.repository }}/worker:${{ steps.image-tag.outputs.tag }}" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          echo "task_def=$NEW_DEF" >> $GITHUB_OUTPUT
+
+      - name: Register new task definition (API)
+        id: register-api
+        run: |
+          NEW_REVISION=$(aws ecs register-task-definition --cli-input-json '${{ steps.new-task-api.outputs.task_def }}' --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_def_arn=$NEW_REVISION" >> $GITHUB_OUTPUT
+
+      - name: Register new task definition (MCP)
+        id: register-mcp
+        run: |
+          NEW_REVISION=$(aws ecs register-task-definition --cli-input-json '${{ steps.new-task-mcp.outputs.task_def }}' --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_def_arn=$NEW_REVISION" >> $GITHUB_OUTPUT
+
+      - name: Register new task definition (Worker)
+        id: register-worker
+        run: |
+          NEW_REVISION=$(aws ecs register-task-definition --cli-input-json '${{ steps.new-task-worker.outputs.task_def }}' --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_def_arn=$NEW_REVISION" >> $GITHUB_OUTPUT
+
+      - name: Update API service (Blue/Green deploy)
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_API }} \
+            --task-definition ${{ steps.register-api.outputs.task_def_arn }} \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100"
+
+      - name: Update MCP service (Blue/Green deploy)
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_MCP }} \
+            --task-definition ${{ steps.register-mcp.outputs.task_def_arn }} \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100"
+
+      - name: Update Worker service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE_WORKER }} \
+            --task-definition ${{ steps.register-worker.outputs.task_def_arn }} \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100"
+
+      - name: Wait for API service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE_API }}
+
+      - name: Wait for MCP service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE_MCP }}
+
+      - name: Wait for Worker service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE_WORKER }}
+
+      - name: Verify health endpoints
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers --names contextforge-staging-alb --query 'LoadBalancers[0].DNSName' --output text)
+          echo "ALB DNS: $ALB_DNS"
+
+          # Wait for health checks to pass
+          for i in {1..30}; do
+            if curl -sf "http://$ALB_DNS/health" > /dev/null; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            echo "Waiting for health check... ($i/30)"
+            sleep 10
+          done
+          echo "Health check failed!"
+          exit 1
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Staging deployment successful!"
+          echo "Image tag: ${{ steps.image-tag.outputs.tag }}"
+          echo "ALB: http://$(aws elbv2 describe-load-balancers --names contextforge-staging-alb --query 'LoadBalancers[0].DNSName' --output text)"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed! Initiating rollback..."
+          # Rollback to previous task definition
+          PREV_API=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_API }}:$(($(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_API }} --query 'taskDefinition.revision' --output text) - 1)) --query 'taskDefinition.taskDefinitionArn' --output text)
+          PREV_MCP=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_MCP }}:$(($(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_MCP }} --query 'taskDefinition.revision' --output text) - 1)) --query 'taskDefinition.taskDefinitionArn' --output text)
+          PREV_WORKER=$(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_WORKER }}:$(($(aws ecs describe-task-definition --task-definition ${{ env.TASK_FAMILY_WORKER }} --query 'taskDefinition.revision' --output text) - 1)) --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          aws ecs update-service --cluster ${{ env.ECS_CLUSTER }} --service ${{ env.ECS_SERVICE_API }} --task-definition $PREV_API --force-new-deployment
+          aws ecs update-service --cluster ${{ env.ECS_CLUSTER }} --service ${{ env.ECS_SERVICE_MCP }} --task-definition $PREV_MCP --force-new-deployment
+          aws ecs update-service --cluster ${{ env.ECS_CLUSTER }} --service ${{ env.ECS_SERVICE_WORKER }} --task-definition $PREV_WORKER --force-new-deployment
+
+          echo "Rollback initiated to previous revisions"

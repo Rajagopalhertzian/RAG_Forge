@@ -1,0 +1,332 @@
+# ContextForge Production Docker Compose
+# Production overrides with resource limits, health checks, and secrets management
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+version: '3.9'
+
+services:
+  # =============================================================================
+  # API Server (Production)
+  # =============================================================================
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+      target: production
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}/api:${IMAGE_TAG:-latest}
+    container_name: contextforge-api-prod
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - VECTOR_STORE=pgvector
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=contextforge-api
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+      - SECRET_KEY=${SECRET_KEY}
+      - API_KEY_HEADER=X-API-Key
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - CORS_ALLOW_CREDENTIALS=true
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_REQUESTS_PER_MINUTE=1000
+      - RATE_LIMIT_BURST=50
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - contextforge-prod-network
+    secrets:
+      - database_password
+      - redis_password
+      - secret_key
+      - openai_api_key
+      - aws_credentials
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /ecs/contextforge-prod/api
+        awslogs-region: ${AWS_REGION:-us-east-1}
+        awslogs-stream-prefix: api
+
+  # =============================================================================
+  # MCP Server (Production)
+  # =============================================================================
+  mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mcp
+      target: production
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}/mcp:${IMAGE_TAG:-latest}
+    container_name: contextforge-mcp-prod
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - VECTOR_STORE=pgvector
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=contextforge-mcp
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+      - MCP_SERVER_HOST=0.0.0.0
+      - MCP_SERVER_PORT=8001
+      - MCP_AUTH_ENABLED=true
+      - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS}
+    ports:
+      - "8001:8001"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8001/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - contextforge-prod-network
+    secrets:
+      - database_password
+      - redis_password
+      - mcp_cert
+      - mcp_key
+      - aws_credentials
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /ecs/contextforge-prod/mcp
+        awslogs-region: ${AWS_REGION:-us-east-1}
+        awslogs-stream-prefix: mcp
+
+  # =============================================================================
+  # Celery Worker (Production) - Use Fargate Spot compatible settings
+  # =============================================================================
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+      target: production
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}/worker:${IMAGE_TAG:-latest}
+    container_name: contextforge-worker-prod
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - VECTOR_STORE=pgvector
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=contextforge-worker
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+      - CELERY_WORKER_CONCURRENCY=4
+      - CELERY_WORKER_PREFETCH_MULTIPLIER=4
+      - CELERY_WORKER_MAX_TASKS_PER_CHILD=1000
+      - CELERY_TASK_TIME_LIMIT=3600
+      - CELERY_TASK_SOFT_TIME_LIMIT=3000
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+        window: 300s
+      replicas: 3
+    healthcheck:
+      test: ["CMD", "celery", "-A", "contextforge.workers.celery_app", "inspect", "ping"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+    networks:
+      - contextforge-prod-network
+    secrets:
+      - database_password
+      - redis_password
+      - openai_api_key
+      - aws_credentials
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /ecs/contextforge-prod/worker
+        awslogs-region: ${AWS_REGION:-us-east-1}
+        awslogs-stream-prefix: worker
+
+  # =============================================================================
+  # Celery Beat Scheduler (Production)
+  # =============================================================================
+  beat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+      target: production
+    image: ${ECR_REGISTRY}/${ECR_REPOSITORY}/worker:${IMAGE_TAG:-latest}
+    container_name: contextforge-beat-prod
+    command: celery -A contextforge.workers.celery_app beat --loglevel=info --scheduler celery.beat.PersistentScheduler
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_SERVICE_NAME=contextforge-beat
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    healthcheck:
+      test: ["CMD", "celery", "-A", "contextforge.workers.celery_app", "inspect", "ping"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 60s
+    networks:
+      - contextforge-prod-network
+    secrets:
+      - database_password
+      - redis_password
+    volumes:
+      - beat_data:/app/celerybeat-schedule
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /ecs/contextforge-prod/beat
+        awslogs-region: ${AWS_REGION:-us-east-1}
+        awslogs-stream-prefix: beat
+
+  # =============================================================================
+  # OpenTelemetry Collector (Production)
+  # =============================================================================
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.106.0
+    container_name: contextforge-otel-prod
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.prod.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics
+      - "13133:13133" # Health check
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:13133"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - contextforge-prod-network
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /ecs/contextforge-prod/otel
+        awslogs-region: ${AWS_REGION:-us-east-1}
+        awslogs-stream-prefix: otel
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  contextforge-prod-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  beat_data:
+    driver: local
+
+# =============================================================================
+# Secrets (managed by Docker Swarm / ECS)
+# =============================================================================
+secrets:
+  database_password:
+    external: true
+    name: contextforge-prod-db-password
+  redis_password:
+    external: true
+    name: contextforge-prod-redis-password
+  secret_key:
+    external: true
+    name: contextforge-prod-secret-key
+  openai_api_key:
+    external: true
+    name: contextforge-prod-openai-api-key
+  aws_credentials:
+    external: true
+    name: contextforge-prod-aws-credentials
+  mcp_cert:
+    external: true
+    name: contextforge-prod-mcp-cert
+  mcp_key:
+    external: true
+    name: contextforge-prod-mcp-key

@@ -1,0 +1,71 @@
+# ContextForge API Dockerfile
+# Multi-stage build for production optimization
+
+# =============================================================================
+# Base stage - common dependencies
+# =============================================================================
+FROM python:3.11-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_VERSION=0.4.0
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN pip install --no-cache-dir "uv==${UV_VERSION}"
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser -m -d /home/appuser -s /bin/bash appuser
+
+WORKDIR /app
+
+# =============================================================================
+# Builder stage - install dependencies
+# =============================================================================
+FROM base AS builder
+
+# Copy dependency files
+COPY pyproject.toml uv.lock* ./
+
+# Install dependencies
+RUN uv sync --frozen --no-dev
+
+# =============================================================================
+# Production stage
+# =============================================================================
+FROM base AS production
+
+# Copy installed dependencies
+COPY --from=builder /app/.venv /app/.venv
+
+# Copy application code
+COPY --chown=appuser:appuser src/ ./src/
+COPY --chown=appuser:appuser scripts/ ./scripts/
+COPY --chown=appuser:appuser alembic.ini ./
+COPY --chown=appuser:appuser alembic/ ./alembic/
+
+# Create data directories
+RUN mkdir -p /app/data /app/logs && chown -R appuser:appuser /app/data /app/logs
+
+# Switch to non-root user
+USER appuser
+
+# Add virtualenv to PATH
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Expose port
+EXPOSE 8000
+
+# Run the application
+CMD ["uvicorn", "contextforge.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]

@@ -1,0 +1,71 @@
+# ContextForge Worker Dockerfile
+# Celery worker for async ingestion jobs
+
+# =============================================================================
+# Base stage - common dependencies
+# =============================================================================
+FROM python:3.11-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_VERSION=0.4.0
+
+# Install system dependencies
+# Note: tree-sitter may need build tools for some languages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    build-essential \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN pip install --no-cache-dir "uv==${UV_VERSION}"
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser -m -d /home/appuser -s /bin/bash appuser
+
+WORKDIR /app
+
+# =============================================================================
+# Builder stage - install dependencies
+# =============================================================================
+FROM base AS builder
+
+# Copy dependency files
+COPY pyproject.toml uv.lock* ./
+
+# Install all dependencies (including dev for tree-sitter grammars)
+RUN uv sync --frozen --all-extras
+
+# =============================================================================
+# Production stage
+# =============================================================================
+FROM base AS production
+
+# Copy installed dependencies
+COPY --from=builder /app/.venv /app/.venv
+
+# Copy application code
+COPY --chown=appuser:appuser src/ ./src/
+COPY --chown=appuser:appuser scripts/ ./scripts/
+COPY --chown=appuser:appuser alembic.ini ./
+COPY --chown=appuser:appuser alembic/ ./alembic/
+
+# Create data directories
+RUN mkdir -p /app/data /app/logs && chown -R appuser:appuser /app/data /app/logs
+
+# Switch to non-root user
+USER appuser
+
+# Add virtualenv to PATH
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Health check for worker
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD celery -A contextforge.workers.celery_app inspect ping || exit 1
+
+# Run the worker
+CMD ["celery", "-A", "contextforge.workers.celery_app", "worker", "--loglevel=info", "--concurrency=4", "--max-tasks-per-child=1000"]
